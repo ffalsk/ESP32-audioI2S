@@ -2,10 +2,10 @@
  *  aac_decoder.cpp
  *  faad2 - ESP32 adaptation
  *  Created on: 12.09.2023
- *  Updated on: 13.08.2024
+ *  Updated on: 14.01.2025
 */
 
-
+#include "Arduino.h"
 #include "aac_decoder.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,10 +14,14 @@
 #include <time.h>
 #include "libfaad/neaacdec.h"
 
+
 // Declaration of the required global variables
+
 NeAACDecHandle hAac;
-NeAACDecFrameInfo_t frameInfo;
-NeAACDecConfigurationPtr_t conf;
+NeAACDecFrameInfo frameInfo;
+NeAACDecConfigurationPtr conf;
+const uint8_t  SYNCWORDH = 0xff; /* 12-bit syncword */
+const uint8_t  SYNCWORDL = 0xf0;
 bool f_decoderIsInit = false;
 bool f_firstCall = false;
 bool f_setRaWBlockParams = false;
@@ -27,7 +31,7 @@ uint8_t aacProfile = 0;
 static uint16_t validSamples = 0;
 clock_t before;
 float compressionRatio = 1;
-mp4AudioSpecificConfig_t* mp4ASC;
+mp4AudioSpecificConfig* mp4ASC;
 
 //----------------------------------------------------------------------------------------------------------------------
 bool AACDecoder_IsInit(){
@@ -51,7 +55,7 @@ void AACDecoder_FreeBuffers(){
     f_decoderIsInit = false;
     f_firstCall = false;
     clock_t difference = clock() - before;
-    int msec = difference  / CLOCKS_PER_SEC;
+    int msec = difference  / CLOCKS_PER_SEC; (void)msec;
 //    printf("ms %li\n", difference);
 }
 //----------------------------------------------------------------------------------------------------------------------
@@ -74,15 +78,49 @@ uint8_t AACGetParametricStereo(){  // not used (0) or used (1)
 }
 //----------------------------------------------------------------------------------------------------------------------
 int AACFindSyncWord(uint8_t *buf, int nBytes){
-    (void) buf;
-    (void)nBytes;
-    return 0;
+    const int MIN_ADTS_HEADER_SIZE = 7;
+    auto validate = [](const uint8_t *buf) -> bool { // check the ADTS header for validity
+        // Layer (bits 14-15) must be 00
+        if ((buf[1] & 0x06) != 0x00) {
+            return false;
+        }
+
+        // Sampling Frequency Index (Bits 18-21) cannot be invalid
+        uint8_t sampling_frequency_index = (buf[2] & 0x3C) >> 2;
+        if (sampling_frequency_index > 12) {
+            return false;
+        }
+
+        // Frame length (bits 30-42) must be at least the header size
+        int frame_length = ((buf[3] & 0x03) << 11) | (buf[4] << 3) | ((buf[5] & 0xE0) >> 5);
+        if (frame_length < MIN_ADTS_HEADER_SIZE) {
+            return false;
+        }
+
+        return true;
+    };
+
+    /* find byte-aligned syncword (12 bits = 0xFFF) */
+    for (int i = 0; i < nBytes - 1; i++) {
+        if ( (buf[i+0] & SYNCWORDH) == SYNCWORDH && (buf[i+1] & SYNCWORDL) == SYNCWORDL ){
+            int frame_length = ((buf[i + 3] & 0x03) << 11) | (buf[i + 4] << 3) | ((buf[i + 5] & 0xE0) >> 5);
+            if (i + frame_length + MIN_ADTS_HEADER_SIZE > nBytes) {
+                return -1; // Puffergrenze überschritten, kein gültiger Header
+            }
+            /* find a second byte-aligned syncword (12 bits = 0xFFF) */
+            if ( (buf[i + frame_length + 0] & SYNCWORDH) == SYNCWORDH && (buf[i + frame_length + 1] & SYNCWORDL) == SYNCWORDL ){
+                return validate(&buf[i]) ? i : -1;
+            }
+        }
+    }
+
+    return -1;
 }
 //----------------------------------------------------------------------------------------------------------------------
 int AACSetRawBlockParams(int nChans, int sampRateCore, int profile){
     f_setRaWBlockParams = true;
     aacChannels = nChans;  // 1: Mono, 2: Stereo
-    aacSamplerate = sampRateCore; // 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000
+    aacSamplerate = (uint32_t)sampRateCore; // 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000
     aacProfile = profile; //1: AAC Main, 2: AAC LC (Low Complexity), 3: AAC SSR (Scalable Sample Rate), 4: AAC LTP (Long Term Prediction)
     return 0;
 }
@@ -113,6 +151,8 @@ void createAudioSpecificConfig(uint8_t* config, uint8_t audioObjectType, uint8_t
     config[1] = (samplingFrequencyIndex << 7) | (channelConfiguration << 3);
 }
 //----------------------------------------------------------------------------------------------------------------------
+extern uint8_t get_sr_index(const uint32_t samplerate);
+
 int AACDecode(uint8_t *inbuf, int32_t *bytesLeft, short *outbuf){
     uint8_t* ob = (uint8_t*)outbuf;
     if (f_firstCall == false){
@@ -122,21 +162,20 @@ int AACDecode(uint8_t *inbuf, int32_t *bytesLeft, short *outbuf){
             conf->outputFormat = FAAD_FMT_16BIT;
             conf->useOldADTSFormat = 1;
             conf->defObjectType = 2;
-            int8_t ret = NeAACDecSetConfiguration(hAac, conf);
+            int8_t ret = NeAACDecSetConfiguration(hAac, conf); (void)ret;
 
             uint8_t specificInfo[2];
             createAudioSpecificConfig(specificInfo, aacProfile, get_sr_index(aacSamplerate), aacChannels);
-            int8_t err = NeAACDecInit2(hAac, specificInfo, 2, &aacSamplerate, &aacChannels);
+            int8_t err = NeAACDecInit2(hAac, specificInfo, 2, &aacSamplerate, &aacChannels);(void)err;
         }
         else{
             NeAACDecSetConfiguration(hAac, conf);
-            int8_t err = NeAACDecInit(hAac, inbuf, *bytesLeft, &aacSamplerate, &aacChannels);
+            int8_t err = NeAACDecInit(hAac, inbuf, *bytesLeft, &aacSamplerate, &aacChannels); (void)err;
         }
         f_firstCall = true;
     }
 
     NeAACDecDecode2(hAac, &frameInfo, inbuf, *bytesLeft, (void**)&ob, 2048 * 2 * sizeof(int16_t));
-
     *bytesLeft -= frameInfo.bytesconsumed;
     validSamples = frameInfo.samples;
     int8_t err = 0 - frameInfo.error;
